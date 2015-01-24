@@ -1,9 +1,10 @@
 package main
 
 /*
-
-#cgo LDFLAGS: -framework ApplicationServices
+#cgo LDFLAGS: -framework Cocoa -framework ApplicationServices
+#cgo CFLAGS: -x objective-c
 #include "ApplicationServices/ApplicationServices.h"
+#import "header.h"
 
 int64_t SystemIdleTime(void) {
   CFTimeInterval timeSinceLastEvent;
@@ -18,22 +19,45 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"runtime"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 const (
 	Freq = time.Second
-	Min  = 30 * time.Second
+	Min  = 5 * time.Minute
 )
 
 func main() {
-	b, _ := boottime()
-	s, _ := sleeptime()
-	w, _ := waketime()
-	fmt.Println(b, s, w)
-	for idleTime := range sysIdleTimeTicker(Freq, Min) {
-		fmt.Println(idleTime)
+	go runMainThread()
+	mainThread <- func() { C.StartApp() }
+
+	totalIdleTime := time.Duration(0)
+	for idleChange := range sysIdleTimeTicker(Freq, Min) {
+		totalIdleTime += idleChange
+		fmt.Println(idleChange.String())
+		setMenuLabel(totalIdleTime.String())
+	}
+}
+
+func setMenuLabel(l string) {
+	mainThread <- func() {
+		cs := C.CString(l)
+		C.SetLabelText(cs)
+		C.free(unsafe.Pointer(cs))
+	}
+}
+
+var mainThread = make(chan func())
+
+func runMainThread() {
+	for f := range mainThread {
+		go func() {
+			runtime.LockOSThread()
+			f()
+		}()
 	}
 }
 
