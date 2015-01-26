@@ -1,104 +1,94 @@
 package main
 
 /*
-#cgo LDFLAGS: -framework Cocoa -framework ApplicationServices
+#cgo LDFLAGS: -framework Cocoa -framework ApplicationServices -framework IOKit
 #cgo CFLAGS: -x objective-c
-#include "ApplicationServices/ApplicationServices.h"
 #import "header.h"
-
-int64_t SystemIdleTime(void) {
-  CFTimeInterval timeSinceLastEvent;
-  timeSinceLastEvent = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateCombinedSessionState, kCGAnyInputEventType);
-  return timeSinceLastEvent * 1000000000;
-}
-
 */
 import "C"
 
 import (
-	"bytes"
-	"encoding/binary"
+	"flag"
 	"fmt"
-	"runtime"
-	"syscall"
+	"log"
+	"os"
 	"time"
 	"unsafe"
 )
 
-const (
-	Freq = time.Second
-	Min  = 5 * time.Minute
+var (
+	idlePollFrequency = flag.Duration("f", 10*time.Second, "sets idle time polling frequency")
+	idleMinDuration   = flag.Duration("m", 5*time.Minute, "minimum idle time to subtract from uptime")
+	debug             = flag.Bool("d", false, "print debug info")
+	help              = flag.Bool("h", false, "show help message")
+
+	startAt  time.Time     // reference time for when computer started or woke last
+	onTime   time.Duration // total time on
+	idleTime time.Duration // total idle time
+	upTime   time.Duration // total active time
 )
 
 func main() {
-	go runMainThread()
-	mainThread <- func() { C.StartApp() }
+	flag.Parse()
+	if *help {
+		flag.PrintDefaults()
+		os.Exit(0)
+	}
 
-	totalIdleTime := time.Duration(0)
-	for idleChange := range sysIdleTimeTicker(Freq, Min) {
-		totalIdleTime += idleChange
-		fmt.Println(idleChange.String())
-		setMenuLabel(totalIdleTime.String())
+	// gather boot and wake times
+	boot, err := bootTime()
+	if err != nil {
+		log.Fatal(err)
+	}
+	wake, err := wakeTime()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// used either boot or wake time, whichever is later,
+	// as reference starting time
+	if wake.After(*boot) {
+		startAt = *wake
+	} else {
+		startAt = *boot
+	}
+
+	// start main thread loop
+	go startMainThread()
+	// start OSX app
+	runOnMainThread(func() { C.StartApp() })
+
+	// start idle poller
+	go startSysIdleTimePoller(*idlePollFrequency, *idleMinDuration)
+	// update ticker
+	updateTicker := time.NewTicker(time.Second).C
+
+	// update the status bar with current upTime
+	update := func() {
+		onTime = time.Since(startAt)
+		upTime = onTime - idleTime
+		setMenuLabel(formatDuration(upTime))
+		if *debug {
+			fmt.Printf("onTime: %q\tidleTime: %q\tupTime: %q\n", onTime, idleTime, upTime)
+		}
+	}
+	for {
+		select {
+		case <-updateTicker:
+			update()
+		case idleInc := <-idleTicker:
+			// idle time has increased
+			idleTime += idleInc
+			update()
+		}
 	}
 }
 
+// setMenuLabel changes the text in the app's menu bar
 func setMenuLabel(l string) {
-	mainThread <- func() {
+	runOnMainThread(func() {
 		cs := C.CString(l)
 		C.SetLabelText(cs)
 		C.free(unsafe.Pointer(cs))
-	}
-}
-
-var mainThread = make(chan func())
-
-func runMainThread() {
-	for f := range mainThread {
-		go func() {
-			runtime.LockOSThread()
-			f()
-		}()
-	}
-}
-
-func boottime() (*time.Time, error) {
-	return sysCtlTimeByName("kern.boottime")
-}
-
-func sleeptime() (*time.Time, error) {
-	return sysCtlTimeByName("kern.sleeptime")
-}
-
-func waketime() (*time.Time, error) {
-	return sysCtlTimeByName("kern.waketime")
-}
-
-func sysCtlTimeByName(name string) (*time.Time, error) {
-	v, err := syscall.Sysctl(name)
-	if err != nil {
-		return nil, fmt.Errorf("%s error: %q", name, err)
-	}
-
-	var secs int64
-	buf := bytes.NewBufferString(v)
-	if err = binary.Read(buf, binary.LittleEndian, &secs); err != nil {
-		return nil, fmt.Errorf("binary.Read error: %q", err)
-	}
-	u := time.Unix(int64(secs), 0)
-	return &u, nil
-}
-
-func sysIdleTimeTicker(freq time.Duration, min time.Duration) <-chan time.Duration {
-	c := make(chan time.Duration)
-	go func() {
-		var prev, curr time.Duration
-		for _ = range time.NewTicker(freq).C {
-			curr = time.Duration(C.SystemIdleTime())
-			if curr < prev && prev >= min {
-				c <- (prev + freq)
-			}
-			prev = curr
-		}
-	}()
-	return c
+	})
 }
